@@ -9,14 +9,41 @@ jobs:
   fetch:
     runs-on: ubuntu-latest
     timeout-minutes: 120
+    env:
+      DATABRICKS_HOST: ${{ secrets.DATABRICKS_HOST }}
+      DATABRICKS_TOKEN: ${{ secrets.DATABRICKS_TOKEN }}
+      JOB_ID: "212956071479335"
+      VOLUME_PATH: /Volumes/workspace/default/steam
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
       - run: pip install requests
-      - run: python scripts/fetch_steamspy.py
+
+      - name: Set run date (UTC)
+        run: echo "RUN_DATE=$(date -u +%F)" >> "$GITHUB_ENV"
+
+      - name: Fetch all pages
+        run: python scripts/fetch_steamspy.py --date "$RUN_DATE"
+
       - uses: actions/upload-artifact@v4
         with:
           name: steamspy-data
           path: steamspy_*.jsonl
+
+      - name: Upload file to Databricks Volume
+        run: |
+          curl --fail-with-body -sS -X PUT \
+            -H "Authorization: Bearer $DATABRICKS_TOKEN" \
+            -H "Content-Type: application/octet-stream" \
+            --data-binary @"steamspy_${RUN_DATE}.jsonl" \
+            "$DATABRICKS_HOST/api/2.0/fs/files$VOLUME_PATH/steamspy_${RUN_DATE}.jsonl?overwrite=true"
+
+      - name: Trigger pipeline job
+        run: |
+          curl --fail-with-body -sS -X POST \
+            -H "Authorization: Bearer $DATABRICKS_TOKEN" \
+            -H "Content-Type: application/json" \
+            -d "{\"job_id\": $JOB_ID, \"job_parameters\": {\"load_type\": \"incremental\", \"date\": \"$RUN_DATE\"}}" \
+            "$DATABRICKS_HOST/api/2.1/jobs/run-now"
