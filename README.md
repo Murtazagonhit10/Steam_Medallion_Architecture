@@ -104,7 +104,7 @@ New columns that appear in the source are added to this table automatically (sch
 
 ### Silver: `silver_steam`
 
-Typed, cleaned, current-state view: exactly one row per game. Silver keeps only the fields needed for analysis, so `score_rank`, `userscore` and the playtime columns stay in Bronze only.
+Typed, cleaned, current-state view: exactly one row per game. All 17 source fields are cast to proper types.
 
 **Primary key:** `appid`
 
@@ -125,6 +125,12 @@ Typed, cleaned, current-state view: exactly one row per game. Silver keeps only 
 | `initialprice_usd` | DOUBLE | `initialprice / 100` |
 | `discount_pct` | DOUBLE | Cast from string |
 | `is_free` | BOOLEAN | `price_usd = 0` |
+| `score_rank` | INT | Cast from string. Blank in the source for almost every game, so usually `NULL` |
+| `userscore` | INT | Cast from string. 0 for almost every game in the source |
+| `average_forever_min` | INT | Average playtime since release, in minutes. Cast from `average_forever` |
+| `average_2weeks_min` | INT | Average playtime in the last two weeks, in minutes. Cast from `average_2weeks` |
+| `median_forever_min` | INT | Median playtime since release, in minutes. Cast from `median_forever` |
+| `median_2weeks_min` | INT | Median playtime in the last two weeks, in minutes. Cast from `median_2weeks` |
 | `row_hash` | STRING | Carried over from Bronze |
 | `first_load_date` | DATE | Date the game first appeared in Silver |
 | `last_load_date` | DATE | Date the game's data was last updated |
@@ -134,6 +140,7 @@ Typed, cleaned, current-state view: exactly one row per game. Silver keeps only 
 - Rows that fail a cast or validation (invalid `appid`, uncastable numeric fields, unparsable `owners`) go to `silver_quarantine`.
 - Dead entries with 0 reviews and 0 concurrent users are dropped. They are not quarantined and not counted in any log column.
 - Only one row per `appid` is kept per run (the most recent).
+- Blank values (such as an empty `score_rank`) become `NULL` and are not treated as failed casts.
 - Update guard: an existing Silver row is updated only if its `row_hash` changed **and** the incoming `load_date` is not older than the stored `last_load_date`. Backfilling an old date therefore never overwrites newer data.
 
 ### Supporting tables
@@ -189,6 +196,7 @@ notebooks/03_bronze_to_silver.ipynb       Bronze to Silver, quarantine bad rows
 notebooks/04_pipeline_runner.ipynb        Runs 02 then 03 for one date (manual runs)
 notebooks/05_run_stats.ipynb              New / changed game counts per run
 notebooks/06_schema_drift_test.ipynb      Demo of schema drift and bad-data handling
+notebooks/07_rebuild_silver.ipynb         Empties Silver and rebuilds it from Bronze, date by date
 steam_data_collection.ipynb               Initial data collection and sample exploration
 bronze_full_load_sample.json              Sample full load (~82,500 games, ~42 MB)
 bronze_incremental_2026-10-07.json        Sample incremental load (1,000 games)
@@ -265,6 +273,8 @@ A full load writes every row in the file to Bronze, with no change filtering.
 
 **Bronze to Silver only** (for example after fixing a cleaning rule): run `03_bronze_to_silver` with `date = <date>`. Add `batch_id` to reprocess one batch only.
 
+**Full Silver rebuild** (for example after adding a column to Silver): run `07_rebuild_silver`. It empties `silver_steam` and replays every Bronze date in order through `03_bronze_to_silver`. Bronze is not touched, so the rebuild can be repeated safely.
+
 **Raw to Bronze from a non-standard file:** run `02_raw_to_bronze` with `landing_path = <path to file>`.
 
 Backfills and re-runs are safe:
@@ -324,10 +334,13 @@ These runs were carried out on the real data and are recorded in `pipeline_execu
 - Silver has fewer rows than the file on a full load because 478 dead entries were dropped during cleaning.
 - Of the 6,674 rows loaded on 2026-10-10, 26 were new games and 6,648 were existing games whose values had changed.
 - After these runs Bronze holds 89,192 rows and Silver holds 82,066 rows, with no duplicate `appid` in Silver.
+- Full Silver rebuild on 2026-10-19: after the six remaining source fields were added, Silver was emptied and rebuilt from Bronze for every loaded date (2026-10-09 to 2026-10-18). It ended at 82,144 rows, the same count as before the rebuild, with 82,144 distinct `appid`.
 
 ## Notes and Limitations
 
 - SteamSpy owner counts are estimated ranges, not exact figures.
+- The SteamSpy bulk endpoint (`request=all`) returns 0 for all four playtime fields for every game, and `score_rank` and `userscore` are filled for only a few dozen games. These fields are kept and typed in Silver but carry almost no information for analysis.
+- No data was loaded for 2026-10-12 because that day's fetch did not produce a file. The API cannot return past data, so that date cannot be backfilled.
 - Data is a once-a-day snapshot, so changes between refreshes are not captured.
 - The workflow fetches at 22:00 UTC. File names and `load_date` use the UTC date of the fetch.
 - There is no delete step. A game that disappears from the API stays in Silver with the last values that were loaded.
