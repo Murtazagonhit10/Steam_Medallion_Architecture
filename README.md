@@ -373,6 +373,235 @@ Built as a pair project for a Data Analysis and Visualization course.
 | Ghulam Murtaza | [@Murtazagonhit10](https://github.com/Murtazagonhit10) |
 | Aima Shakeel | [@aimashakeelsaddozai-code](https://github.com/aimashakeelsaddozai-code) |
 
-## Data Source
+## Gold Layer: Dimensional Model
+
+The Gold layer lives in the `workspace.gold` schema. It is built from Silver (`silver_steam` and `silver_steam_history`) by `10_silver_to_gold`, which runs as the third task of the daily job. All tables are Delta tables, and every load uses `MERGE`, so re-running a date changes nothing.
+
+The model has two parts:
+
+- **Business star schema:** three fact tables that share conformed dimensions (date, game, publisher, developer). One filter on a shared dimension slices every fact at once.
+- **Audit mart:** `fact_pipeline_run` with `dim_date` and `dim_pipeline_layer`, used for the pipeline health page.
+
+Delta tables do not enforce keys, so the keys below are logical keys that the `MERGE` statements and the Power BI relationships rely on.
+
+### ER diagram
+
+```mermaid
+erDiagram
+    dim_date ||--o{ fact_game_daily_snapshot : "date_key"
+    dim_game ||--o{ fact_game_daily_snapshot : "game_key"
+    dim_publisher ||--o{ fact_game_daily_snapshot : "publisher_key"
+    dim_developer ||--o{ fact_game_daily_snapshot : "developer_key"
+    dim_price_tier ||--o{ fact_game_daily_snapshot : "price_tier_key"
+    dim_owners_band ||--o{ fact_game_daily_snapshot : "owners_band_key"
+
+    dim_date ||--o{ fact_price_change : "date_key"
+    dim_game ||--o{ fact_price_change : "game_key"
+    dim_publisher ||--o{ fact_price_change : "publisher_key"
+    dim_developer ||--o{ fact_price_change : "developer_key"
+    dim_change_type ||--o{ fact_price_change : "change_type_key"
+
+    dim_date ||--o{ fact_game_listing : "date_key"
+    dim_game ||--o{ fact_game_listing : "game_key"
+    dim_publisher ||--o{ fact_game_listing : "publisher_key"
+    dim_developer ||--o{ fact_game_listing : "developer_key"
+    dim_price_tier ||--o{ fact_game_listing : "price_tier_key"
+    dim_owners_band ||--o{ fact_game_listing : "owners_band_key"
+
+    dim_date ||--o{ fact_pipeline_run : "date_key"
+    dim_pipeline_layer ||--o{ fact_pipeline_run : "layer_key"
+
+    fact_game_daily_snapshot {
+        int date_key FK
+        int game_key FK
+        bigint publisher_key FK
+        bigint developer_key FK
+        int price_tier_key FK
+        int owners_band_key FK
+        double price_usd
+        double discount_pct
+        boolean is_on_sale
+        int total_reviews
+        double approval_rate
+        bigint owners_mid
+    }
+    fact_price_change {
+        int date_key FK
+        int game_key FK
+        bigint publisher_key FK
+        bigint developer_key FK
+        int change_type_key FK
+        double old_price_usd
+        double new_price_usd
+        double new_discount_pct
+    }
+    fact_game_listing {
+        int date_key FK
+        int game_key FK
+        bigint publisher_key FK
+        bigint developer_key FK
+        int price_tier_key FK
+        int owners_band_key FK
+    }
+    fact_pipeline_run {
+        string run_id PK
+        int date_key FK
+        int layer_key FK
+        string status
+        double duration_seconds
+        bigint rows_inserted
+    }
+    dim_date {
+        int date_key PK
+        date full_date
+    }
+    dim_game {
+        int game_key PK
+        string game_name
+    }
+    dim_publisher {
+        bigint publisher_key PK
+        string publisher_name
+    }
+    dim_developer {
+        bigint developer_key PK
+        string developer_name
+    }
+    dim_price_tier {
+        int price_tier_key PK
+        string tier_name
+    }
+    dim_owners_band {
+        int owners_band_key PK
+        string band_label
+    }
+    dim_change_type {
+        int change_type_key PK
+        string change_type
+    }
+    dim_pipeline_layer {
+        int layer_key PK
+        string layer_name
+    }
+```
+
+### Fact tables
+
+#### fact_game_daily_snapshot (periodic snapshot)
+
+**Grain:** one row per game per loaded day, holding the game's state on that day.
+**Primary key:** (`date_key`, `game_key`)
+**Built from:** each game's latest `silver_steam_history` row on or before the date.
+
+| Column | Type | Key / measure | Description |
+|---|---|---|---|
+| date_key | INT | FK to dim_date | Day of the snapshot (yyyymmdd) |
+| game_key | INT | FK to dim_game | The game |
+| publisher_key | BIGINT | FK to dim_publisher | First listed publisher |
+| developer_key | BIGINT | FK to dim_developer | First listed developer |
+| price_tier_key | INT | FK to dim_price_tier | Tier of the list price |
+| owners_band_key | INT | FK to dim_owners_band | Estimated ownership range |
+| price_usd | DOUBLE | Measure (non-additive) | Current price in US dollars |
+| initialprice_usd | DOUBLE | Measure (non-additive) | List price in US dollars |
+| discount_pct | DOUBLE | Measure (non-additive) | Current discount in percent |
+| is_on_sale | BOOLEAN | Measure (additive as 0/1) | True when discount is above 0 |
+| positive | INT | Measure (semi-additive) | Positive reviews |
+| negative | INT | Measure (semi-additive) | Negative reviews |
+| total_reviews | INT | Measure (semi-additive) | positive + negative |
+| approval_rate | DOUBLE | Measure (non-additive) | positive / total_reviews |
+| ccu | INT | Measure (semi-additive) | Peak concurrent users |
+| owners_min | BIGINT | Measure (semi-additive) | Lower bound of estimated owners |
+| owners_max | BIGINT | Measure (semi-additive) | Upper bound of estimated owners |
+| owners_mid | BIGINT | Measure (semi-additive) | Midpoint of the owners range |
+| load_timestamp | TIMESTAMP | Metadata | When the row was written |
+
+Semi-additive measures can be summed across games but not across days, so the Power BI measures always use the latest day in the selected range.
+
+#### fact_price_change (transaction)
+
+**Grain:** one row per game per day on which its price or discount changed.
+**Primary key:** (`date_key`, `game_key`)
+**Built from:** each game's `silver_steam_history` row for the date compared with its previous row.
+
+| Column | Type | Key / measure | Description |
+|---|---|---|---|
+| date_key | INT | FK to dim_date | Day of the change |
+| game_key | INT | FK to dim_game | The game |
+| publisher_key | BIGINT | FK to dim_publisher | First listed publisher |
+| developer_key | BIGINT | FK to dim_developer | First listed developer |
+| change_type_key | INT | FK to dim_change_type | Kind of change |
+| old_price_usd | DOUBLE | Measure | Price before the change |
+| new_price_usd | DOUBLE | Measure | Price after the change |
+| price_change_usd | DOUBLE | Measure (additive) | new_price_usd minus old_price_usd |
+| old_discount_pct | DOUBLE | Measure | Discount before the change |
+| new_discount_pct | DOUBLE | Measure | Discount after the change |
+| old_initialprice_usd | DOUBLE | Measure | List price before the change |
+| new_initialprice_usd | DOUBLE | Measure | List price after the change |
+| load_timestamp | TIMESTAMP | Metadata | When the row was written |
+
+#### fact_game_listing (factless)
+
+**Grain:** one row per game, on the day it first appeared in the tracked list. The first full load (2026-10-09) is the baseline and is not counted as new listings.
+**Primary key:** `game_key`
+
+| Column | Type | Key | Description |
+|---|---|---|---|
+| date_key | INT | FK to dim_date | Day the game was first tracked |
+| game_key | INT | FK to dim_game | The game |
+| publisher_key | BIGINT | FK to dim_publisher | First listed publisher |
+| developer_key | BIGINT | FK to dim_developer | First listed developer |
+| price_tier_key | INT | FK to dim_price_tier | Tier of the list price on that day |
+| owners_band_key | INT | FK to dim_owners_band | Ownership range on that day |
+| load_timestamp | TIMESTAMP | Metadata | When the row was written |
+
+The table has no numeric measures; its value is in counting rows (number of new listings).
+
+#### fact_pipeline_run (audit mart, transaction)
+
+**Grain:** one row per pipeline step run.
+**Primary key:** `run_id`
+**Built from:** `workspace.steam.pipeline_execution_logs`.
+
+| Column | Type | Key / measure | Description |
+|---|---|---|---|
+| run_id | STRING | PK | Unique ID of the run |
+| date_key | INT | FK to dim_date | Day the run started |
+| layer_key | INT | FK to dim_pipeline_layer | Pipeline step |
+| load_type | STRING | Degenerate dimension | full or incremental |
+| status | STRING | Degenerate dimension | Success or Failure |
+| file_processed | STRING | Degenerate dimension | File or date processed |
+| start_time | TIMESTAMP | Attribute | Start of the run |
+| end_time | TIMESTAMP | Attribute | End of the run |
+| duration_seconds | DOUBLE | Measure | end_time minus start_time |
+| rows_inserted | BIGINT | Measure (additive) | Rows inserted |
+| rows_updated | BIGINT | Measure (additive) | Rows updated |
+| rows_skipped_unchanged | BIGINT | Measure (additive) | Rows skipped as unchanged |
+| rows_quarantined | BIGINT | Measure (additive) | Rows sent to quarantine |
+| error_message | STRING | Attribute | Error text on failure |
+| load_timestamp | TIMESTAMP | Metadata | When the row was written |
+
+### Dimension tables
+
+| Table | Primary key | Attributes | Notes |
+|---|---|---|---|
+| dim_date | date_key (INT, yyyymmdd) | full_date, day_of_month, day_name, day_of_week (1 = Monday), is_weekend, week_of_year, month_num, month_name, quarter, year | One row per calendar day, including days with no data |
+| dim_game | game_key (INT, the Steam appid) | appid, game_name, is_free, first_tracked_date | SCD Type 1: names are overwritten with the latest value |
+| dim_publisher | publisher_key (BIGINT) | publisher_name | Key is a hash of the name; -1 = Unknown |
+| dim_developer | developer_key (BIGINT) | developer_name | Key is a hash of the name; -1 = Unknown |
+| dim_price_tier | price_tier_key (INT) | tier_name, min_price_usd, max_price_usd, sort_order | Free, Under $5, $5 to $20, $20 to $40, Over $40; based on list price |
+| dim_owners_band | owners_band_key (INT) | band_label, owners_min, owners_max, sort_order | SteamSpy ownership ranges; key = upper bound in thousands |
+| dim_change_type | change_type_key (INT) | change_type, description | Sale started, Sale ended, Discount changed, Price increase, Price decrease |
+| dim_pipeline_layer | layer_key (INT) | layer_name, step_order | Raw-to-Bronze, Bronze-to-Silver, Silver-to-Gold, Pipeline-Runner |
+
+Every dimension also has a `load_timestamp` column.
+
+### Design decisions
+
+- **Stable surrogate keys.** `game_key` is the Steam appid, publisher and developer keys are a hash of the name, and owners band keys come from the band's upper bound. Rebuilding Gold therefore always produces the same keys, so facts never point at the wrong dimension row.
+- **Unknown member.** Games with no publisher or developer link to the `-1 Unknown` row, so no fact row has a missing key.
+- **First listed publisher and developer.** Some games list several (for example "Valve, Hidden Path"). Each game is linked to the first one, which keeps every relationship one-to-many. A many-to-many bridge table would add complexity to the Power BI model for little analytical gain.
+- **Price tier by list price.** Tiers use `initialprice_usd`, so a temporary sale does not move a game into a cheaper tier.
+- **Liquid Clustering.** The facts are clustered on `date_key` and `game_key` (`CLUSTER BY`), so queries filtered by date or game read fewer files.
+- **History from Silver.** `silver_steam` holds the current state and `silver_steam_history` holds one typed row per game per changed date. Gold reads only from these two tables, never from Bronze.
 
 Data comes from the [SteamSpy API](https://steamspy.com/api.php). SteamSpy refreshes its aggregates once a day, so stats such as concurrent users (`ccu`) and review counts change slowly for the biggest games.
