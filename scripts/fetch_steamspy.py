@@ -28,10 +28,7 @@ while True:
         print(f"page {page} empty, done")
         break
     all_games.update(data)
-    print(f"page {page} done - total: {len(all_games)}")
-    if len(data) < 1000:
-        print("last page reached")
-        break
+    print(f"page {page}: {len(data)} games | total: {len(all_games)}")
     page += 1
     time.sleep(2)
 
