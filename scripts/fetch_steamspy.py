@@ -11,12 +11,16 @@ while True:
     url = f"https://steamspy.com/api.php?request=all&page={page}"
     data = None
     for attempt in range(4):
+        r = None
         try:
             r = requests.get(url, timeout=60)
             r.raise_for_status()
             data = r.json() if r.text.strip() else {}
             break
         except Exception as e:
+            status = r.status_code if r is not None else "no response"
+            body = r.text[:300] if r is not None else ""
+            print(f"page {page} attempt {attempt + 1} failed: {e} | status: {status} | body: {body!r}")
             if attempt == 3:
                 raise SystemExit(f"page {page} failed after retries: {e}")
             time.sleep(10 * (attempt + 1))
