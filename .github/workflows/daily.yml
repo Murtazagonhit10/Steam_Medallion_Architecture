@@ -25,7 +25,7 @@ jobs:
         run: echo "RUN_DATE=$(date -u +%F)" >> "$GITHUB_ENV"
 
       - name: Fetch all pages
-        run: python scripts/fetch_steamspy.py --date "$RUN_DATE"
+        run: python -u scripts/fetch_steamspy.py --date "$RUN_DATE"
 
       - uses: actions/upload-artifact@v4
         with:
